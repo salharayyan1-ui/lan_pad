@@ -1,32 +1,35 @@
-# LAN Sketchpad
+# LAN Pad
 
-A **vibecoded** app that turns your phone into a drawing pad for an infinite, pan/zoomable canvas on your desktop.
+A highly optimized app that turns your phone into a low-latency drawing pad for an infinite, pan/zoomable canvas on your desktop.
 
 ## How it Works
-The app uses a Python backend with `PySide6` for the desktop GUI and `websockets` for real-time communication. Your phone connects to a local HTTP server to load the drawing interface, and then sends touch events over WebSockets back to the desktop app.
+The app uses a Python backend with `PySide6` for the desktop GUI and `websockets` (via `asyncio`) for real-time communication. Your phone connects to a local HTTP server to load the drawing interface, and then sends touch events over WebSockets back to the desktop app. It features a thread-safe bridge to prevent GUI blocking.
 
-## Running the App
+## Setup & Connection (USB Recommended)
+For the lowest latency and highest security, it is strongly recommended to connect your phone via a physical USB cable and use **USB Tethering**.
 
-You can either run the pre-packaged standalone executable or run it from the Python source.
+1. Connect your phone to your PC via USB.
+2. Enable **USB Tethering** on your phone (Settings > Network & Internet > Hotspot & Tethering).
+3. Run the application (`dist/sketchpad.exe` or `python sketchpad.py`).
+4. The desktop canvas will open. Look at the top-left corner of the canvas for your phone connection URL and your 4-digit PIN.
+5. Open that URL in your phone's Chrome browser, enter the PIN, and start sketching!
 
-### Option 1: Standalone Executable (Windows)
-1. Locate and double-click `dist/sketchpad.exe`.
-2. The desktop canvas will open. Look at the top-left corner of the canvas for your phone connection URL (e.g., `Phone URL: http://192.168.x.x:8000`).
-3. Make sure your phone is on the same WiFi network as your laptop.
-4. Open that URL in your phone's web browser and start sketching!
+## The Phone Interface (100% Pure Touch)
+The phone acts as a pure, UI-free trackpad. All tools are controlled via multi-touch gestures:
 
-### Option 2: Running from Source
-1. Ensure you have the required dependencies installed (e.g., `PySide6`, `websockets`).
-2. Run the application:
-   ```bash
-   python sketchpad.py
-   ```
-3. The connection URL will be printed in the terminal (and on the canvas). Connect your phone on the same WiFi to that URL.
+**Basic Drawing:**
+- **1 Finger Drag:** Draw
+
+**Tools & Canvas Control:**
+- **2 Finger Tap:** Toggle between Pen and Eraser
+- **2 Finger Drag:** Pan around the infinite canvas
+- **2 Finger Pinch:** Zoom in and out
+
+**Advanced Control:**
+- **3 Finger Tap:** Undo last stroke
+- **3 Finger Vertical Drag:** Smoothly adjust the pen/eraser size! (Swipe up to increase, down to decrease). 
+- **4 Finger Tap:** Clear the entire canvas and snap the camera back to center at 100% zoom.
 
 ## Files
 - `sketchpad.py`: The main desktop GUI application (PySide6) and WebSocket/HTTP server.
-- `server.py`: A simpler milestone version that just prints touch events (for testing).
 - `index.html`: The mobile web interface served to the phone.
-
----
-*This is a vibecoded app.*

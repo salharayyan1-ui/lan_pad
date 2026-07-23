@@ -18,6 +18,8 @@ import json
 import socket
 import sys
 import threading
+import random
+import os
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,15 +37,28 @@ else:
     ROOT = Path(__file__).parent
 
 
-def get_lan_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def get_all_ips() -> list:
+    ips = []
     try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        hostname = socket.gethostname()
+        _, _, ip_addresses = socket.gethostbyname_ex(hostname)
+        for ip in ip_addresses:
+            if not ip.startswith("127."):
+                ips.append(ip)
+    except Exception:
+        pass
+    if not ips:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ips.append(s.getsockname()[0])
+        except OSError:
+            ips.append("127.0.0.1")
+        finally:
+            s.close()
+    return ips
+
+APP_PIN = f"{random.randint(0, 9999):04d}"
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +88,30 @@ class NetworkBridge(QObject):
 
     async def _ws_handler(self, websocket):
         print(f"[ws] client connected: {websocket.remote_address}")
+        
+        try:
+            # Enforce PIN Auth (First message must be auth)
+            auth_msg = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+            data = json.loads(auth_msg)
+            if data.get("type") != "auth" or data.get("pin") != APP_PIN:
+                print(f"[ws] Auth failed for {websocket.remote_address}")
+                await websocket.close(1008, "Invalid PIN")
+                return
+        except Exception as e:
+            print(f"[ws] Auth error: {e}")
+            await websocket.close(1008, "Auth required")
+            return
+            
+        print(f"[ws] Auth success for {websocket.remote_address}!")
+        
+        # Enforce Single Device Limit
+        for old_ws in list(self._clients):
+            try:
+                await old_ws.close(1000, "New device connected")
+            except Exception:
+                pass
+        self._clients.clear()
+        
         self._clients.add(websocket)
         try:
             await self._send_snapshot(websocket)  # replay current scene
@@ -100,10 +139,8 @@ class NetworkBridge(QObject):
         async def main():
             threading.Thread(target=self._serve_http, daemon=True).start()
             self._loop = asyncio.get_running_loop()
-            ip = get_lan_ip()
             print("=" * 48)
-            print("LAN Sketchpad - Milestone 6 (two-way mirror)")
-            print(f"  On your phone, open:  http://{ip}:{HTTP_PORT}")
+            print("LAN Sketchpad - Milestone 8 (Auth & USB)")
             print("=" * 48)
             async with websockets.serve(self._ws_handler, "0.0.0.0", WS_PORT):
                 await asyncio.Future()  # run forever
@@ -192,7 +229,7 @@ def smooth_path(pts):
 class Canvas(QWidget):
     def __init__(self):
         super().__init__()
-        self._ip = get_lan_ip()
+        self._ips = get_all_ips()
         self.setMinimumSize(800, 600)
         # StrongFocus: a QWidget only receives key events when it has focus.
         self.setFocusPolicy(Qt.StrongFocus)
@@ -260,8 +297,10 @@ class Canvas(QWidget):
         mods = event.modifiers()
         if mods & Qt.ControlModifier and key == Qt.Key_Z:
             self._undo()
+        elif key == Qt.Key_Delete:
+            self._clear()
         elif mods & Qt.ControlModifier and key == Qt.Key_S:
-            self._save_png()
+            self._save_canvas()
         elif key == Qt.Key_E:
             self._mode = "erase"
             self._emit_tool()
@@ -336,12 +375,21 @@ class Canvas(QWidget):
         self.update()
 
     # ---- shared stroke pipeline (source-agnostic: phone OR mouse) ---------
-    def _begin_stroke(self, origin="laptop"):
+    def _begin_stroke(self, origin="laptop", color=None, width=None):
         # Width is stored in WORLD units so it renders at the intended on-screen
         # thickness at the current zoom (and scales correctly if zoomed later).
-        color = BG_COLOR if self._mode == "erase" else STROKE_COLOR
-        self._cur = {"points": [], "width": self._active_width() / self._scale,
-                     "color": color, "origin": origin}
+        if color is None:
+            c = BG_COLOR if self._mode == "erase" else STROKE_COLOR
+        else:
+            c = QColor(color)
+            
+        if width is None:
+            w = self._active_width() / self._scale
+        else:
+            w = float(width)
+            
+        self._cur = {"points": [], "width": w,
+                     "color": c, "origin": origin}
         self._ema = None
 
     def _extend_stroke(self, screen_pt):
@@ -388,6 +436,12 @@ class Canvas(QWidget):
             self.bridge.undo()
         self.update()
 
+    def _clear(self):
+        self._strokes.clear()
+        if self.bridge:
+            self.bridge.clear()
+        self.update()
+
     # ---- touch input from the phone (SLOT, runs on the GUI thread) --------
     def on_touch(self, data: dict):
         if data.get("type") == "camera":
@@ -397,14 +451,31 @@ class Canvas(QWidget):
             self._scale = zoom
             c = self._viewport_center()
             self._pan = QPointF(c.x() - zoom * lax, c.y() - zoom * lay)
-            self._emit_camera()      # re-broadcast to all clients
+            # Do NOT emit_camera() here! Bouncing it back causes the phone's 
+            # local camera state to momentarily revert, causing flickers.
             self.update()
             return
         if data.get("type") == "undo":
             self._undo()
             return
+        if data.get("type") == "clear":
+            self._clear()
+            return
+        if data.get("type") == "tool":
+            self._mode = data.get("mode", "draw")
+            w = data.get("width", 3.0)
+            if self._mode == "erase":
+                self._erase_width = w
+            else:
+                self._draw_width = w
+            self.update()
+            return
         if data.get("type") == "start":
-            self._begin_stroke(origin=data.get("id", "phone"))
+            self._begin_stroke(
+                origin=data.get("id", "phone"),
+                color=data.get("color"),
+                width=data.get("w")
+            )
 
         if data.get("count", 0) == 0 or not data.get("points"):
             self._end_stroke()
@@ -466,10 +537,31 @@ class Canvas(QWidget):
         painter.save()
         painter.translate(self._pan)
         painter.scale(self._scale, self._scale)
+
         for stroke in self._strokes:
             self._draw_stroke(painter, stroke)
         if self._cur and self._cur["points"]:
             self._draw_stroke(painter, self._cur)
+
+        # --- Premium Dot Grid (Drawn ON TOP of strokes so eraser doesn't hide it) ---
+        w_top_left = self._screen_to_world(QPointF(0, 0))
+        w_bottom_right = self._screen_to_world(QPointF(self.width(), self.height()))
+        spacing = 40
+        start_x = int(w_top_left.x() // spacing)
+        end_x = int(w_bottom_right.x() // spacing) + 1
+        start_y = int(w_top_left.y() // spacing)
+        end_y = int(w_bottom_right.y() // spacing) + 1
+        
+        if (end_x - start_x) * (end_y - start_y) < 15000:
+            dot_size = max(2.0, 3.0 / self._scale)
+            painter.setPen(QPen(QColor(255, 255, 255, 50), dot_size, Qt.SolidLine, Qt.RoundCap))
+            points = []
+            for ix in range(start_x, end_x):
+                for iy in range(start_y, end_y):
+                    points.append(QPointF(ix * spacing, iy * spacing))
+            if points:
+                painter.drawPoints(points)
+        # ------------------------
         painter.restore()
 
         # Live cursor ring (screen space, sized to the on-screen brush width).
@@ -488,10 +580,14 @@ class Canvas(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.setPen(QColor("#9aa0b4"))
         painter.drawText(12, 24, label)
-        painter.drawText(12, 44, f"Phone URL: http://{self._ip}:{HTTP_PORT}")
+        ip_str = "  ".join(f"http://{ip}:{HTTP_PORT}" for ip in self._ips)
+        painter.drawText(12, 44, f"Phone URLs: {ip_str}")
+        
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(12, 64, f"PIN: {APP_PIN}")
 
-    # ---- save canvas as PNG -----------------------------------------------
-    def _save_png(self):
+    # ---- save canvas as PNG or PDF ----------------------------------------
+    def _save_canvas(self):
         if not self._strokes:
             return
         # Bounding box of all strokes in world coordinates.
@@ -510,20 +606,36 @@ class Canvas(QWidget):
         max_x += pad; max_y += pad
         w = max(1, int(max_x - min_x))
         h = max(1, int(max_y - min_y))
-        # Render to QImage.
-        img = QImage(w, h, QImage.Format_ARGB32)
-        img.fill(BG_COLOR)
-        painter = QPainter(img)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.translate(-min_x, -min_y)
-        for stroke in self._strokes:
-            self._draw_stroke(painter, stroke)
-        painter.end()
+        
         # File dialog.
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Canvas", "sketchpad.png",
-            "PNG Image (*.png);;JPEG Image (*.jpg)")
-        if path:
+            "PNG Image (*.png);;JPEG Image (*.jpg);;PDF Document (*.pdf)")
+        if not path:
+            return
+
+        if path.lower().endswith('.pdf'):
+            from PySide6.QtGui import QPdfWriter, QPageSize
+            from PySide6.QtCore import QSizeF
+            writer = QPdfWriter(path)
+            writer.setPageSize(QPageSize(QSizeF(w, h), QPageSize.Point))
+            pdf_painter = QPainter(writer)
+            pdf_painter.setRenderHint(QPainter.Antialiasing)
+            pdf_painter.translate(-min_x, -min_y)
+            for stroke in self._strokes:
+                self._draw_stroke(pdf_painter, stroke)
+            pdf_painter.end()
+            print(f"[save] exported to {path}  ({w}×{h} px)")
+        else:
+            # Render to QImage.
+            img = QImage(w, h, QImage.Format_ARGB32)
+            img.fill(BG_COLOR)
+            painter = QPainter(img)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.translate(-min_x, -min_y)
+            for stroke in self._strokes:
+                self._draw_stroke(painter, stroke)
+            painter.end()
             img.save(path)
             print(f"[save] exported to {path}  ({w}×{h} px)")
 

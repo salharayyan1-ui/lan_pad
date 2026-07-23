@@ -106,6 +106,17 @@
     let volUpLast = 0;               // timestamp of last Vol Up press
     let volDownLast = 0;
 
+    function syncTool() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "tool",
+          id: myId,
+          mode: mode,
+          width: mode === "eraser" ? localEraseWidth / cam.zoom : localDrawWidth / cam.zoom
+        }));
+      }
+    }
+
     function setMode(newMode) {
       if (mode === newMode) {
         flashIndicator();
@@ -113,6 +124,7 @@
       }
       mode = newMode;
       flashIndicator();
+      syncTool();
     }
 
     function adjustSize(delta) {
@@ -122,6 +134,7 @@
         localDrawWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, localDrawWidth + delta));
       }
       flashIndicator(true);
+      syncTool();
     }
 
     function flashIndicator(showSize) {
@@ -149,31 +162,7 @@
       return mode === "eraser" ? localEraseWidth : localDrawWidth;
     }
 
-    // ---- intercept volume keys (Android Chrome fires these as keydown) ----
-    // Single press  → toggle mode (pen / eraser)
-    // Double press  → adjust size (+2 for Vol Up, -2 for Vol Down)
-    document.addEventListener("keydown", e => {
-      const now = Date.now();
-      if (e.key === "AudioVolumeUp" || e.key === "VolumeUp") {
-        e.preventDefault();
-        if (now - volUpLast < DOUBLE_PRESS_MS) {
-          volUpLast = 0;           // consume the double-press
-          adjustSize(+SIZE_STEP);  // increase brush size
-        } else {
-          volUpLast = now;
-          setMode("pen");
-        }
-      } else if (e.key === "AudioVolumeDown" || e.key === "VolumeDown") {
-        e.preventDefault();
-        if (now - volDownLast < DOUBLE_PRESS_MS) {
-          volDownLast = 0;
-          adjustSize(-SIZE_STEP);  // decrease brush size
-        } else {
-          volDownLast = now;
-          setMode("eraser");
-        }
-      }
-    });
+    // (Hardware volume button listeners removed in favor of pure touch gestures)
 
     // Shared world state (mirrors the laptop).
     let cam = { zoom: 1, lax: 0, lay: 0 };     // look-at (world) + zoom
@@ -248,6 +237,13 @@
         cam.zoom = msg.zoom; cam.lax = msg.lax; cam.lay = msg.lay; redraw();
       } else if (msg.t === "tool") {
         tool.color = msg.color; tool.w = msg.w;
+        mode = (msg.color === BG_COLOR) ? "eraser" : "pen";
+        if (mode === "eraser") {
+          localEraseWidth = msg.w * cam.zoom;
+        } else {
+          localDrawWidth = msg.w * cam.zoom;
+        }
+        flashIndicator(true);
       } else if (msg.t === "stroke") {
         if (msg.origin !== myId) {          // ignore echoes of our own strokes
           strokes.push({ pts: msg.pts, w: msg.w, color: msg.color });
@@ -261,19 +257,44 @@
     }
 
     // ---- network ----
+    let pin = localStorage.getItem("lanpad_pin");
+
     function connect() {
+      if (!pin) {
+        pin = prompt("Enter the 4-digit PIN shown on your laptop screen:");
+        if (pin) localStorage.setItem("lanpad_pin", pin);
+      }
+      if (!pin) {
+        setStatus("PIN required. Refresh to try again.");
+        return;
+      }
+
       const url = `ws://${location.hostname}:${WS_PORT}`;
       setStatus(`connecting to ${url} …`);
       ws = new WebSocket(url);
       ws.onopen = () => {
+        // Clear local strokes before receiving the server snapshot
+        strokes = [];
+        
+        // Send authentication
+        ws.send(JSON.stringify({ type: "auth", pin: pin }));
+        
         setStatus(`connected → mirrored with laptop`);
         // Auto-hide status bar after connection confirmed
         setTimeout(() => statusEl.classList.add("hidden"), 3000);
       };
-      ws.onclose = () => {
+      ws.onclose = (e) => {
         statusEl.classList.remove("hidden");   // reappear on disconnect
-        setStatus(`disconnected — retrying…`);
-        setTimeout(connect, 1000);
+        if (e.code === 1008) {
+          localStorage.removeItem("lanpad_pin");
+          pin = null;
+          setStatus("Invalid PIN. Refresh to try again.");
+        } else if (e.code === 1000 && e.reason === "New device connected") {
+          setStatus("Disconnected. Another device took over.");
+        } else {
+          setStatus(`disconnected — retrying…`);
+          setTimeout(connect, 1000);
+        }
       };
       ws.onerror = () => {
         statusEl.classList.remove("hidden");
@@ -285,7 +306,12 @@
     function sendPoint(type, wx, wy, force) {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const points = (wx === null) ? [] : [{ wx, wy, force }];
-      ws.send(JSON.stringify({ type, id: myId, count: points.length, points }));
+      let msg = { type, id: myId, count: points.length, points };
+      if (type === "start" && cur) {
+        msg.color = cur.color;
+        msg.w = cur.w;
+      }
+      ws.send(JSON.stringify(msg));
     }
 
     // ---- touch: draw locally in world space AND forward world coords ----
@@ -364,8 +390,9 @@
           beginLocal(t.clientX, t.clientY);
         }
       } else {
-        // Multi-finger: cancel any in-progress stroke and start gesture tracking
+        // Multi-finger: keep any in-progress stroke so we stay in sync with the laptop
         if (cur) {
+          if (cur.pts.length) strokes.push(cur);
           cur = null; ema = null;
           sendPoint("end", null, null, 0);
           redraw();
@@ -375,6 +402,8 @@
           startTime: Date.now(),
           startPositions: Array.from(e.touches).map(t => [t.clientX, t.clientY]),
           mode: "pending",     // "pending" → "pinch" (if fingers move) or tap (on lift)
+          panVelocity: { x: 0, y: 0 },
+          lastPanTime: Date.now(),
         };
         // Pre-compute pinch baseline for two-finger gestures
         if (touchCount === 2) {
@@ -424,23 +453,45 @@
             cam.lax = owx - (info.mx - W2) / cam.zoom;
             cam.lay = owy - (info.my - H2) / cam.zoom;
 
-            // Sync camera to laptop
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({
-                type: "camera", id: myId,
-                zoom: Math.round(cam.zoom * 1000) / 1000,
-                lax: Math.round(cam.lax * 100) / 100,
-                lay: Math.round(cam.lay * 100) / 100,
-              }));
-            }
-
+            syncCamera();
             redraw();
+
+            // Track velocity for kinetic panning
+            const now = Date.now();
+            const dt = Math.max(1, now - gs.lastPanTime);
+            gs.panVelocity = {
+              x: (info.mx - gs.lastMid[0]) / dt,
+              y: (info.my - gs.lastMid[1]) / dt
+            };
+            gs.lastPanTime = now;
           }
 
           gs.lastMid = [info.mx, info.my];
           gs.lastDist = info.dist;
         }
-        // --- Three-finger: just check tap threshold ---
+        // --- Three-finger swipe for resizing ---
+        else if (e.touches.length === 3 && gs.count === 3) {
+          if (gs.mode === "pending") {
+            for (let i = 0; i < 3; i++) {
+              const [sx, sy] = gs.startPositions[i];
+              const dx = e.touches[i].clientX - sx;
+              const dy = e.touches[i].clientY - sy;
+              if (Math.sqrt(dx * dx + dy * dy) > TAP_MOVE_PX) {
+                gs.mode = "size_drag";
+                gs.lastY = (e.touches[0].clientY + e.touches[1].clientY + e.touches[2].clientY) / 3;
+                break;
+              }
+            }
+          }
+          if (gs.mode === "size_drag") {
+            const currentY = (e.touches[0].clientY + e.touches[1].clientY + e.touches[2].clientY) / 3;
+            const deltaY = currentY - gs.lastY;
+            // Swipe UP (negative delta) to INCREASE size.
+            adjustSize(-deltaY * 0.4); 
+            gs.lastY = currentY;
+          }
+        }
+        // --- Multi-finger tap tracking ---
         else if (gs.mode === "pending") {
           for (let i = 0; i < e.touches.length && i < gs.startPositions.length; i++) {
             const [sx, sy] = gs.startPositions[i];
@@ -468,11 +519,20 @@
           const elapsed = Date.now() - gs.startTime;
           if (elapsed < TAP_MS) {
             if (gs.count === 2) {
+              if (navigator.vibrate) navigator.vibrate(20);
               setMode(mode === "pen" ? "eraser" : "pen");
-            } else if (gs.count >= 3) {
-              cycleSizeUp();
+            } else if (gs.count === 3) {
+              if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
+              requestUndo();
+            } else if (gs.count >= 4) {
+              if (navigator.vibrate) navigator.vibrate([20, 30, 20]);
+              requestClear();
+              resetCamera();
             }
           }
+        } else if (gs.mode === "pinch") {
+          // Launch kinetic panning
+          launchKineticPanning(gs.panVelocity.x, gs.panVelocity.y);
         }
         gestureState = null;
         return;
@@ -486,36 +546,73 @@
       if (cur) endLocal();
     }, { passive: false });
 
-    // ---- shake to undo (DeviceMotion API, Android Chrome) ----
-    const SHAKE_THRESHOLD = 30;        // m/s² total acceleration to trigger
-    const SHAKE_COOLDOWN_MS = 800;     // prevent rapid-fire undos
-    let lastShakeTime = 0;
-
-    window.addEventListener("devicemotion", e => {
-      const a = e.accelerationIncludingGravity;
-      if (!a) return;
-      const mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
-      if (mag > SHAKE_THRESHOLD) {
-        const now = Date.now();
-        if (now - lastShakeTime > SHAKE_COOLDOWN_MS) {
-          lastShakeTime = now;
-          requestUndo();
-        }
-      }
-    });
+    // (Hardware shake listener removed in favor of pure touch gestures)
 
     function requestUndo() {
-      // Send undo request to laptop (laptop will broadcast back)
+      // Send undo request to laptop
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "undo", id: myId }));
       }
-      // Flash undo indicator
-      modeEl.className = "";
-      modeEl.textContent = "↩️  UNDO";
-      void modeEl.offsetWidth;
-      modeEl.classList.add("visible", "pen");
-      clearTimeout(modeTimer);
-      modeTimer = setTimeout(() => modeEl.classList.remove("visible"), 1200);
+    }
+
+    function requestClear() {
+      if (navigator.vibrate) navigator.vibrate(80);
+      // Send clear request to laptop (laptop will broadcast back)
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "clear", id: myId }));
+      }
+    }
+
+    function resetCamera() {
+      cam.zoom = 1.0;
+      cam.lax = 0.0;
+      cam.lay = 0.0;
+      syncCamera();
+      redraw();
+    }
+
+    function syncCamera() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "camera", id: myId,
+          zoom: Math.round(cam.zoom * 1000) / 1000,
+          lax: Math.round(cam.lax * 100) / 100,
+          lay: Math.round(cam.lay * 100) / 100,
+        }));
+      }
+    }
+
+    let kineticFrame = null;
+    function launchKineticPanning(vx, vy) {
+      if (kineticFrame) cancelAnimationFrame(kineticFrame);
+      let velX = vx;
+      let velY = vy;
+      const friction = 0.95;
+      const threshold = 0.1;
+      
+      let lastTime = performance.now();
+      
+      function step(time) {
+        const dt = Math.max(1, time - lastTime);
+        lastTime = time;
+        
+        velX *= friction;
+        velY *= friction;
+        
+        if (Math.abs(velX) < threshold && Math.abs(velY) < threshold) {
+          kineticFrame = null;
+          return;
+        }
+        
+        // Panning is shifting the look-at point inversely
+        cam.lax -= (velX * dt) / cam.zoom;
+        cam.lay -= (velY * dt) / cam.zoom;
+        syncCamera();
+        redraw();
+        
+        kineticFrame = requestAnimationFrame(step);
+      }
+      kineticFrame = requestAnimationFrame(step);
     }
 
     resizeCanvas();
