@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>LAN Sketchpad Pad</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #111; color: #eee;
+      -webkit-user-select: none; user-select: none;
+      touch-action: none;
+    }
+    #pad { position: absolute; inset: 0; display: block; background: #1c1c22; touch-action: none; }
+    #status {
+      position: absolute; top: 8px; left: 8px; right: 8px;
+      font-size: 14px; padding: 8px 10px; border-radius: 8px;
+      background: rgba(0,0,0,0.4); pointer-events: none; white-space: pre-line;
+      transition: opacity 0.8s ease;
+    }
+    #status.hidden { opacity: 0; }
+    /* Mode indicator pill at the bottom of the screen */
+    #mode-indicator {
+      position: absolute;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) scale(0.95);
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      padding: 10px 28px;
+      border-radius: 40px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.3s ease, transform 0.3s ease, background 0.3s ease, color 0.3s ease;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      z-index: 100;
+    }
+    #mode-indicator.visible {
+      opacity: 1;
+      transform: translateX(-50%) scale(1);
+    }
+    #mode-indicator.pen {
+      background: rgba(120, 180, 255, 0.25);
+      color: #a0cfff;
+      border: 1px solid rgba(120, 180, 255, 0.3);
+      box-shadow: 0 0 20px rgba(100, 160, 255, 0.15);
+    }
+    #mode-indicator.eraser {
+      background: rgba(255, 140, 120, 0.25);
+      color: #ffb0a0;
+      border: 1px solid rgba(255, 140, 120, 0.3);
+      box-shadow: 0 0 20px rgba(255, 120, 100, 0.15);
+    }
+    /* Subtle help text */
+    #vol-hint {
+      position: absolute;
+      bottom: 72px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 11px;
+      color: rgba(255,255,255,0.25);
+      pointer-events: none;
+      white-space: nowrap;
+      transition: opacity 1.2s ease;
+    }
+    #vol-hint.hidden { opacity: 0; }
+  </style>
+</head>
+<body>
+  <canvas id="pad"></canvas>
+  <div id="status">connecting…</div>
+  <div id="mode-indicator"></div>
+  <div id="vol-hint">2-finger tap = pen/eraser · pinch = zoom · drag = pan · 3-finger tap = size</div>
+
+  <script>
+    const WS_PORT = 8765;
+    const statusEl = document.getElementById("status");
+    const pad = document.getElementById("pad");
+    const ctx = pad.getContext("2d");
+    const modeEl = document.getElementById("mode-indicator");
+
+    const BG_COLOR = "#1c1c22";
+    const DRAW_COLOR = "#e8e8f0";
+    const SIZE_STEP = 2;             // ±2 per double-press, same as desktop [ ]
+    const MIN_WIDTH = 1;
+    const MAX_WIDTH = 160;
+    const DOUBLE_PRESS_MS = 400;     // window for second press
+    const EMA_ALPHA = 0.5;
+
+    // A random id so the laptop can tag our strokes; we ignore echoes of our own.
+    const myId = "p" + Math.random().toString(36).slice(2, 9);
+
+    // ---- local mode + size (pen / eraser), toggled by volume buttons ----
+    let mode = "pen";                // "pen" or "eraser"
+    let localDrawWidth = 3;          // phone's own pen width (independent of laptop)
+    let localEraseWidth = 28;        // phone's own eraser width
+    let modeTimer = null;            // for auto-hiding the indicator
+
+    // Double-press tracking per button
+    let volUpLast = 0;               // timestamp of last Vol Up press
+    let volDownLast = 0;
+
+    function setMode(newMode) {
+      if (mode === newMode) {
+        flashIndicator();
+        return;
+      }
+      mode = newMode;
+      flashIndicator();
+    }
+
+    function adjustSize(delta) {
+      if (mode === "eraser") {
+        localEraseWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, localEraseWidth + delta));
+      } else {
+        localDrawWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, localDrawWidth + delta));
+      }
+      flashIndicator(true);
+    }
+
+    function flashIndicator(showSize) {
+      modeEl.className = "";                         // reset
+      const icon = mode === "pen" ? "✏️" : "🧹";
+      const label = mode === "pen" ? "PEN" : "ERASER";
+      const size = mode === "eraser" ? localEraseWidth : localDrawWidth;
+      modeEl.textContent = showSize
+        ? `${icon}  ${label}  ·  size ${size}`
+        : `${icon}  ${label}`;
+      // Force reflow so the class change re-triggers the transition
+      void modeEl.offsetWidth;
+      modeEl.classList.add("visible", mode === "pen" ? "pen" : "eraser");
+
+      clearTimeout(modeTimer);
+      modeTimer = setTimeout(() => {
+        modeEl.classList.remove("visible");
+      }, 1500);
+    }
+
+    function activeColor() {
+      return mode === "eraser" ? BG_COLOR : DRAW_COLOR;
+    }
+    function activeWidth() {
+      return mode === "eraser" ? localEraseWidth : localDrawWidth;
+    }
+
+    // ---- intercept volume keys (Android Chrome fires these as keydown) ----
+    // Single press  → toggle mode (pen / eraser)
+    // Double press  → adjust size (+2 for Vol Up, -2 for Vol Down)
+    document.addEventListener("keydown", e => {
+      const now = Date.now();
+      if (e.key === "AudioVolumeUp" || e.key === "VolumeUp") {
+        e.preventDefault();
+        if (now - volUpLast < DOUBLE_PRESS_MS) {
+          volUpLast = 0;           // consume the double-press
+          adjustSize(+SIZE_STEP);  // increase brush size
+        } else {
+          volUpLast = now;
+          setMode("pen");
+        }
+      } else if (e.key === "AudioVolumeDown" || e.key === "VolumeDown") {
+        e.preventDefault();
+        if (now - volDownLast < DOUBLE_PRESS_MS) {
+          volDownLast = 0;
+          adjustSize(-SIZE_STEP);  // decrease brush size
+        } else {
+          volDownLast = now;
+          setMode("eraser");
+        }
+      }
+    });
+
+    // Shared world state (mirrors the laptop).
+    let cam = { zoom: 1, lax: 0, lay: 0 };     // look-at (world) + zoom
+    let tool = { color: "#e8e8f0", w: 3 };     // base pen from laptop
+    let strokes = [];                          // committed world strokes {pts,w,color}
+    let cur = null;                            // our in-progress stroke (world)
+    let ema = null;                            // EMA in screen px
+
+    let ws = null;
+
+    function setStatus(m) { statusEl.textContent = m; }
+
+    // ---- camera: each device centers the shared look-at on ITS own screen ----
+    function panX() { return window.innerWidth / 2 - cam.zoom * cam.lax; }
+    function panY() { return window.innerHeight / 2 - cam.zoom * cam.lay; }
+    function screenToWorld(cx, cy) {
+      return [(cx - panX()) / cam.zoom, (cy - panY()) / cam.zoom];
+    }
+
+    // ---- rendering: redraw the whole world through the camera ----
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      pad.width = Math.round(window.innerWidth * dpr);
+      pad.height = Math.round(window.innerHeight * dpr);
+      pad.style.width = window.innerWidth + "px";
+      pad.style.height = window.innerHeight + "px";
+      redraw();
+    }
+
+    function strokePath(pts) {
+      const n = pts.length;
+      if (n === 0) return;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      if (n === 1) {
+        ctx.lineTo(pts[0][0] + 0.01, pts[0][1]);
+      } else {
+        for (let i = 1; i < n - 1; i++) {
+          ctx.quadraticCurveTo(pts[i][0], pts[i][1],
+            (pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2);
+        }
+        ctx.lineTo(pts[n - 1][0], pts[n - 1][1]);
+      }
+      ctx.stroke();
+    }
+
+    function drawStroke(s) {
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = s.w;            // world units; scaled by zoom below
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      strokePath(s.pts);
+    }
+
+    function redraw() {
+      const dpr = window.devicePixelRatio || 1;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = BG_COLOR;
+      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+      // Apply the shared camera, then draw everything in world coords.
+      ctx.translate(panX(), panY());
+      ctx.scale(cam.zoom, cam.zoom);
+      for (const s of strokes) drawStroke(s);
+      if (cur && cur.pts.length) drawStroke(cur);
+    }
+    window.addEventListener("resize", resizeCanvas);
+    window.addEventListener("orientationchange", resizeCanvas);
+
+    // ---- inbound messages from the laptop ----
+    function applyMessage(msg) {
+      if (msg.t === "camera") {
+        cam.zoom = msg.zoom; cam.lax = msg.lax; cam.lay = msg.lay; redraw();
+      } else if (msg.t === "tool") {
+        tool.color = msg.color; tool.w = msg.w;
+      } else if (msg.t === "stroke") {
+        if (msg.origin !== myId) {          // ignore echoes of our own strokes
+          strokes.push({ pts: msg.pts, w: msg.w, color: msg.color });
+          redraw();
+        }
+      } else if (msg.t === "clear") {
+        strokes = []; redraw();
+      } else if (msg.t === "undo") {
+        if (strokes.length > 0) { strokes.pop(); redraw(); }
+      }
+    }
+
+    // ---- network ----
+    function connect() {
+      const url = `ws://${location.hostname}:${WS_PORT}`;
+      setStatus(`connecting to ${url} …`);
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        setStatus(`connected → mirrored with laptop`);
+        // Auto-hide status bar after connection confirmed
+        setTimeout(() => statusEl.classList.add("hidden"), 3000);
+      };
+      ws.onclose = () => {
+        statusEl.classList.remove("hidden");   // reappear on disconnect
+        setStatus(`disconnected — retrying…`);
+        setTimeout(connect, 1000);
+      };
+      ws.onerror = () => {
+        statusEl.classList.remove("hidden");
+        setStatus(`error connecting to ${url}`);
+      };
+      ws.onmessage = e => { try { applyMessage(JSON.parse(e.data)); } catch (_) {} };
+    }
+
+    function sendPoint(type, wx, wy, force) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const points = (wx === null) ? [] : [{ wx, wy, force }];
+      ws.send(JSON.stringify({ type, id: myId, count: points.length, points }));
+    }
+
+    // ---- touch: draw locally in world space AND forward world coords ----
+    // Uses the LOCAL mode (pen/eraser) to decide color and width.
+    function beginLocal(cx, cy) {
+      ema = [cx, cy];
+      const w = activeWidth() / cam.zoom;    // world-space width
+      cur = { pts: [screenToWorld(cx, cy)], w: w, color: activeColor() };
+      redraw();
+      const [wx, wy] = cur.pts[0];
+      sendPoint("start", wx, wy, 0);
+    }
+    function moveLocal(cx, cy, force) {
+      ema = [EMA_ALPHA * cx + (1 - EMA_ALPHA) * ema[0],
+             EMA_ALPHA * cy + (1 - EMA_ALPHA) * ema[1]];
+      const [wx, wy] = screenToWorld(ema[0], ema[1]);
+      cur.pts.push([wx, wy]);
+      redraw();
+      sendPoint("move", wx, wy, force);
+    }
+    function endLocal() {
+      if (cur && cur.pts.length) strokes.push(cur);   // keep our own stroke
+      cur = null; ema = null;
+      sendPoint("end", null, null, 0);
+    }
+
+    // ---- multi-touch gesture detection ----
+    // Two-finger tap   = toggle pen ↔ eraser
+    // Two-finger drag  = pan the canvas
+    // Two-finger pinch = zoom the canvas
+    // Three-finger tap = cycle size up (wraps: 3 → 8 → 16 → 28 → 48 → 3)
+    const TAP_MS = 350;              // max duration for a "tap"
+    const TAP_MOVE_PX = 15;          // max finger travel to still count as a tap
+    const MIN_ZOOM = 0.1;
+    const MAX_ZOOM = 20;
+    const SIZE_PRESETS = [3, 8, 16, 28, 48];
+
+    let gestureState = null;         // tracks multi-finger gestures in progress
+
+    function cycleSizeUp() {
+      if (mode === "eraser") {
+        const idx = SIZE_PRESETS.indexOf(localEraseWidth);
+        localEraseWidth = SIZE_PRESETS[(idx + 1) % SIZE_PRESETS.length];
+      } else {
+        const idx = SIZE_PRESETS.indexOf(localDrawWidth);
+        localDrawWidth = SIZE_PRESETS[(idx + 1) % SIZE_PRESETS.length];
+      }
+      flashIndicator(true);
+    }
+
+    function twoFingerMidAndDist(t0, t1) {
+      return {
+        mx: (t0.clientX + t1.clientX) / 2,
+        my: (t0.clientY + t1.clientY) / 2,
+        dist: Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY),
+      };
+    }
+
+    pad.addEventListener("touchstart", e => {
+      e.preventDefault();
+      const touchCount = e.touches.length;
+
+      if (touchCount === 1) {
+        // Single finger: start drawing (only if no gesture is pending)
+        if (!gestureState) {
+          const t = e.touches[0];
+          beginLocal(t.clientX, t.clientY);
+        }
+      } else {
+        // Multi-finger: cancel any in-progress stroke and start gesture tracking
+        if (cur) {
+          cur = null; ema = null;
+          sendPoint("end", null, null, 0);
+          redraw();
+        }
+        const gs = {
+          count: touchCount,
+          startTime: Date.now(),
+          startPositions: Array.from(e.touches).map(t => [t.clientX, t.clientY]),
+          mode: "pending",     // "pending" → "pinch" (if fingers move) or tap (on lift)
+        };
+        // Pre-compute pinch baseline for two-finger gestures
+        if (touchCount === 2) {
+          const info = twoFingerMidAndDist(e.touches[0], e.touches[1]);
+          gs.lastMid = [info.mx, info.my];
+          gs.lastDist = info.dist;
+        }
+        gestureState = gs;
+      }
+    }, { passive: false });
+
+    pad.addEventListener("touchmove", e => {
+      e.preventDefault();
+      if (gestureState) {
+        const gs = gestureState;
+
+        // --- Two-finger pinch / pan ---
+        if (e.touches.length === 2 && gs.count === 2) {
+          const info = twoFingerMidAndDist(e.touches[0], e.touches[1]);
+
+          // Check if we should transition from "pending" to "pinch"
+          if (gs.mode === "pending") {
+            for (let i = 0; i < 2; i++) {
+              const [sx, sy] = gs.startPositions[i];
+              const dx = e.touches[i].clientX - sx;
+              const dy = e.touches[i].clientY - sy;
+              if (Math.sqrt(dx * dx + dy * dy) > TAP_MOVE_PX) {
+                gs.mode = "pinch";
+                break;
+              }
+            }
+          }
+
+          if (gs.mode === "pinch" && gs.lastDist > 0) {
+            // World point under the PREVIOUS midpoint — we want it to
+            // end up under the NEW midpoint after zoom + pan.
+            const [omx, omy] = gs.lastMid;
+            const [owx, owy] = screenToWorld(omx, omy);
+
+            // Apply zoom (ratio of finger distances)
+            const zoomFactor = info.dist / gs.lastDist;
+            cam.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, cam.zoom * zoomFactor));
+
+            // Adjust look-at so owx,owy maps to the new midpoint
+            const W2 = window.innerWidth / 2;
+            const H2 = window.innerHeight / 2;
+            cam.lax = owx - (info.mx - W2) / cam.zoom;
+            cam.lay = owy - (info.my - H2) / cam.zoom;
+
+            // Sync camera to laptop
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({
+                type: "camera", id: myId,
+                zoom: Math.round(cam.zoom * 1000) / 1000,
+                lax: Math.round(cam.lax * 100) / 100,
+                lay: Math.round(cam.lay * 100) / 100,
+              }));
+            }
+
+            redraw();
+          }
+
+          gs.lastMid = [info.mx, info.my];
+          gs.lastDist = info.dist;
+        }
+        // --- Three-finger: just check tap threshold ---
+        else if (gs.mode === "pending") {
+          for (let i = 0; i < e.touches.length && i < gs.startPositions.length; i++) {
+            const [sx, sy] = gs.startPositions[i];
+            const dx = e.touches[i].clientX - sx;
+            const dy = e.touches[i].clientY - sy;
+            if (Math.sqrt(dx * dx + dy * dy) > TAP_MOVE_PX) {
+              gs.mode = "drag";   // invalidated as a tap, but not a useful gesture
+              break;
+            }
+          }
+        }
+        return;
+      }
+      // Single-finger drawing
+      const t = e.touches[0];
+      if (t && cur) moveLocal(t.clientX, t.clientY, t.force || 0);
+    }, { passive: false });
+
+    pad.addEventListener("touchend", e => {
+      e.preventDefault();
+      if (gestureState && e.touches.length === 0) {
+        const gs = gestureState;
+        // Only fire tap actions if gesture stayed in "pending" mode (no movement)
+        if (gs.mode === "pending") {
+          const elapsed = Date.now() - gs.startTime;
+          if (elapsed < TAP_MS) {
+            if (gs.count === 2) {
+              setMode(mode === "pen" ? "eraser" : "pen");
+            } else if (gs.count >= 3) {
+              cycleSizeUp();
+            }
+          }
+        }
+        gestureState = null;
+        return;
+      }
+      if (!gestureState && cur) endLocal();
+    }, { passive: false });
+
+    pad.addEventListener("touchcancel", e => {
+      e.preventDefault();
+      gestureState = null;
+      if (cur) endLocal();
+    }, { passive: false });
+
+    // ---- shake to undo (DeviceMotion API, Android Chrome) ----
+    const SHAKE_THRESHOLD = 30;        // m/s² total acceleration to trigger
+    const SHAKE_COOLDOWN_MS = 800;     // prevent rapid-fire undos
+    let lastShakeTime = 0;
+
+    window.addEventListener("devicemotion", e => {
+      const a = e.accelerationIncludingGravity;
+      if (!a) return;
+      const mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+      if (mag > SHAKE_THRESHOLD) {
+        const now = Date.now();
+        if (now - lastShakeTime > SHAKE_COOLDOWN_MS) {
+          lastShakeTime = now;
+          requestUndo();
+        }
+      }
+    });
+
+    function requestUndo() {
+      // Send undo request to laptop (laptop will broadcast back)
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "undo", id: myId }));
+      }
+      // Flash undo indicator
+      modeEl.className = "";
+      modeEl.textContent = "↩️  UNDO";
+      void modeEl.offsetWidth;
+      modeEl.classList.add("visible", "pen");
+      clearTimeout(modeTimer);
+      modeTimer = setTimeout(() => modeEl.classList.remove("visible"), 1200);
+    }
+
+    resizeCanvas();
+    connect();
+
+    // Flash initial mode so user knows it's active
+    setTimeout(() => flashIndicator(), 800);
+
+    // Auto-hide the vol-hint after 6 seconds
+    setTimeout(() => document.getElementById("vol-hint").classList.add("hidden"), 6000);
+  </script>
+</body>
+</html>
