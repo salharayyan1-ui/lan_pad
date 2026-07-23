@@ -7,14 +7,21 @@ The app uses a Python backend with `PySide6` for the desktop GUI and `websockets
 
 ## Running the App
 
+You can either run the pre-packaged standalone executable or run it from the Python source.
+
+### Option 1: Standalone Executable (Windows)
+1. Locate and double-click `dist/sketchpad.exe`.
+2. The desktop canvas will open. Look at the top-left corner of the canvas for your phone connection URL (e.g., `Phone URL: http://192.168.x.x:8000`).
+3. Make sure your phone is on the same WiFi network as your laptop.
+4. Open that URL in your phone's web browser and start sketching!
+
+### Option 2: Running from Source
 1. Ensure you have the required dependencies installed (e.g., `PySide6`, `websockets`).
 2. Run the application:
    ```bash
    python sketchpad.py
    ```
-3. Look at your terminal output. It will display a local IP address and port (e.g., `http://<laptop-ip>:8000`).
-4. Make sure your phone is on the same WiFi network as your laptop.
-5. Open that URL in your phone's web browser and start sketching!
+3. The connection URL will be printed in the terminal (and on the canvas). Connect your phone on the same WiFi to that URL.
 
 ## Files
 - `sketchpad.py`: The main desktop GUI application (PySide6) and WebSocket/HTTP server.
