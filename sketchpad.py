@@ -29,7 +29,10 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QWidget
 
 HTTP_PORT = 8000
 WS_PORT = 8765
-ROOT = Path(__file__).parent
+if getattr(sys, 'frozen', False):
+    ROOT = Path(sys._MEIPASS)
+else:
+    ROOT = Path(__file__).parent
 
 
 def get_lan_ip() -> str:
@@ -189,6 +192,7 @@ def smooth_path(pts):
 class Canvas(QWidget):
     def __init__(self):
         super().__init__()
+        self._ip = get_lan_ip()
         self.setMinimumSize(800, 600)
         # StrongFocus: a QWidget only receives key events when it has focus.
         self.setFocusPolicy(Qt.StrongFocus)
@@ -484,6 +488,7 @@ class Canvas(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.setPen(QColor("#9aa0b4"))
         painter.drawText(12, 24, label)
+        painter.drawText(12, 44, f"Phone URL: http://{self._ip}:{HTTP_PORT}")
 
     # ---- save canvas as PNG -----------------------------------------------
     def _save_png(self):

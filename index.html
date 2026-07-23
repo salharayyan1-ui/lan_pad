@@ -346,6 +346,15 @@
 
     pad.addEventListener("touchstart", e => {
       e.preventDefault();
+      
+      // Request device motion permission on first interaction (iOS 13+)
+      if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+        if (!window.__sensorPermissionRequested) {
+          window.__sensorPermissionRequested = true;
+          DeviceMotionEvent.requestPermission().catch(console.error);
+        }
+      }
+      
       const touchCount = e.touches.length;
 
       if (touchCount === 1) {
