@@ -27,11 +27,21 @@ from pathlib import Path
 import websockets
 from PySide6.QtCore import QObject, QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QApplication, QFileDialog, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QWidget, QColorDialog, QHBoxLayout, QPushButton, QSlider
+
+# In a PyInstaller --windowed build there is NO console, so sys.stdout/stderr are
+# None. Any print() would then raise and kill its thread — which is why the
+# WebSocket server appears not to start (the phone can't connect). Route the
+# missing streams to a throwaway sink so every print() is harmless.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
 HTTP_PORT = 8000
 WS_PORT = 8765
 if getattr(sys, 'frozen', False):
+    # PyInstaller unpacks bundled data (index.html) into this temp dir at runtime.
     ROOT = Path(sys._MEIPASS)
 else:
     ROOT = Path(__file__).parent
@@ -43,8 +53,13 @@ def get_all_ips() -> list:
         hostname = socket.gethostname()
         _, _, ip_addresses = socket.gethostbyname_ex(hostname)
         for ip in ip_addresses:
-            if not ip.startswith("127."):
-                ips.append(ip)
+            if ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            if ip.startswith("172."):
+                parts = ip.split(".")
+                if len(parts) == 4 and 16 <= int(parts[1]) <= 31:
+                    continue  # Skip WSL/Hyper-V/Docker defaults
+            ips.append(ip)
     except Exception:
         pass
     if not ips:
@@ -141,6 +156,7 @@ class NetworkBridge(QObject):
             self._loop = asyncio.get_running_loop()
             print("=" * 48)
             print("LAN Sketchpad - Milestone 8 (Auth & USB)")
+            print(f"  PIN: {APP_PIN}")
             print("=" * 48)
             async with websockets.serve(self._ws_handler, "0.0.0.0", WS_PORT):
                 await asyncio.Future()  # run forever
@@ -226,6 +242,135 @@ def smooth_path(pts):
 # the strokes themselves never change. This is what makes the page infinite and
 # also makes future undo/save trivial.
 # ---------------------------------------------------------------------------
+class HUDToolbar(QWidget):
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.canvas = canvas
+        self.setStyleSheet("""
+            QWidget {
+                background-color: rgba(30, 30, 40, 200);
+                border-radius: 15px;
+            }
+            QPushButton {
+                background-color: rgba(255, 255, 255, 20);
+                color: white;
+                border: None;
+                padding: 8px 16px;
+                border-radius: 8px;
+                font-weight: bold;
+                font-family: sans-serif;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 40);
+            }
+            QPushButton:checked {
+                background-color: #4a90e2;
+            }
+            QSlider::groove:horizontal {
+                background: rgba(255, 255, 255, 30);
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: white;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+        """)
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(15, 10, 15, 10)
+        layout.setSpacing(10)
+        
+        self.btn_grid = QPushButton("Grid")
+        self.btn_grid.setCheckable(True)
+        self.btn_grid.setChecked(True)
+        self.btn_grid.clicked.connect(self.toggle_grid)
+        
+        self.btn_pen = QPushButton("Pen")
+        self.btn_pen.setCheckable(True)
+        self.btn_pen.setChecked(True)
+        self.btn_pen.clicked.connect(lambda: self.set_mode("draw"))
+        
+        self.btn_erase = QPushButton("Eraser")
+        self.btn_erase.setCheckable(True)
+        self.btn_erase.clicked.connect(lambda: self.set_mode("erase"))
+        
+        self.btn_color = QPushButton("Color")
+        self.btn_color.clicked.connect(self.choose_color)
+        
+        self.btn_bg = QPushButton("BG")
+        self.btn_bg.clicked.connect(self.choose_bg)
+        
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(1, 50)
+        self.slider.setValue(int(STROKE_WIDTH))
+        self.slider.setFixedWidth(100)
+        self.slider.valueChanged.connect(self.change_width)
+        
+        layout.addWidget(self.btn_grid)
+        layout.addWidget(self.btn_pen)
+        layout.addWidget(self.btn_erase)
+        layout.addWidget(self.btn_color)
+        layout.addWidget(self.btn_bg)
+        layout.addWidget(self.slider)
+        
+    def sync_ui(self):
+        is_erase = self.canvas._mode == "erase"
+        self.btn_erase.setChecked(is_erase)
+        self.btn_pen.setChecked(not is_erase)
+        self.btn_grid.setChecked(self.canvas.show_grid)
+        w = self.canvas._erase_width if is_erase else self.canvas._draw_width
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(w))
+        self.slider.blockSignals(False)
+        self.update_color_btn()
+        
+    def update_color_btn(self):
+        c = self.canvas.stroke_color.name()
+        self.btn_color.setStyleSheet(f"QPushButton {{ border-bottom: 4px solid {c}; }}")
+        b = self.canvas.bg_color.name()
+        self.btn_bg.setStyleSheet(f"QPushButton {{ border-bottom: 4px solid {b}; }}")
+        
+    def toggle_grid(self, checked):
+        self.canvas.show_grid = checked
+        self.canvas._emit_tool()
+        self.canvas.update()
+        
+    def set_mode(self, mode):
+        self.canvas._mode = mode
+        self.sync_ui()
+        self.canvas._emit_tool()
+        self.canvas.update()
+        
+    def choose_color(self):
+        from PySide6.QtGui import QColor
+        color = QColorDialog.getColor(self.canvas.stroke_color, self.canvas, "Choose Pen Color")
+        if color.isValid():
+            self.canvas.stroke_color = color
+            self.update_color_btn()
+            self.canvas._emit_tool()
+            self.canvas.update()
+            
+    def choose_bg(self):
+        from PySide6.QtGui import QColor
+        color = QColorDialog.getColor(self.canvas.bg_color, self.canvas, "Choose Background Color")
+        if color.isValid():
+            self.canvas.bg_color = color
+            self.update_color_btn()
+            self.canvas._emit_tool()
+            self.canvas.update()
+            
+    def change_width(self, val):
+        if self.canvas._mode == "erase":
+            self.canvas._erase_width = val
+        else:
+            self.canvas._draw_width = val
+        self.canvas._emit_tool()
+        self.canvas.update()
+
+
 class Canvas(QWidget):
     def __init__(self):
         super().__init__()
@@ -246,6 +391,13 @@ class Canvas(QWidget):
         self._mode = "draw"     # "draw" or "erase"
         self._draw_width = STROKE_WIDTH    # screen px; adjustable with [ ]
         self._erase_width = ERASER_WIDTH
+        self.stroke_color = QColor(STROKE_COLOR)
+        self.bg_color = QColor(BG_COLOR)
+        self.show_grid = True
+        
+        self.toolbar = HUDToolbar(self)
+        self.toolbar.move(20, 20)
+        self.toolbar.sync_ui()
 
         self._pan = QPointF(0, 0)   # camera translation (screen px)
         self._scale = 1.0           # camera zoom
@@ -278,17 +430,22 @@ class Canvas(QWidget):
                                 "lax": round(look.x(), 2), "lay": round(look.y(), 2)})
 
     def _emit_tool(self):
-        # Tell clients the current ink color + world-space width for their local
-        # echo, so a phone-drawn stroke looks identical before the round-trip.
         if not self.bridge:
             return
-        color = BG_COLOR if self._mode == "erase" else STROKE_COLOR
-        self.bridge.set_tool({"t": "tool", "color": color.name(),
-                              "w": self._active_width() / self._scale})
+        color = self.bg_color if self._mode == "erase" else self.stroke_color
+        self.bridge.set_tool({
+            "t": "tool",
+            "mode": self._mode,
+            "color": color.name(),
+            "bg_color": self.bg_color.name(),
+            "w": self._active_width() / self._scale,
+            "show_grid": self.show_grid
+        })
 
     def _stroke_msg(self, stroke):
         return {"t": "stroke", "origin": stroke.get("origin", "laptop"),
                 "w": stroke["width"], "color": stroke["color"].name(),
+                "is_eraser": stroke.get("is_eraser", False),
                 "pts": [[round(p.x(), 1), round(p.y(), 1)] for p in stroke["points"]]}
 
     # ---- keyboard: mode, brush size, pan, zoom ---------------------------
@@ -375,21 +532,25 @@ class Canvas(QWidget):
         self.update()
 
     # ---- shared stroke pipeline (source-agnostic: phone OR mouse) ---------
-    def _begin_stroke(self, origin="laptop", color=None, width=None):
+    def _begin_stroke(self, origin="laptop", color=None, width=None, is_eraser=None):
         # Width is stored in WORLD units so it renders at the intended on-screen
         # thickness at the current zoom (and scales correctly if zoomed later).
+        if is_eraser is None:
+            is_eraser = (self._mode == "erase")
         if color is None:
-            c = BG_COLOR if self._mode == "erase" else STROKE_COLOR
+            # Use the INSTANCE colors (updated by the toolbar), not the module
+            # constants — otherwise laptop strokes ignore the chosen color.
+            c = self.bg_color if is_eraser else self.stroke_color
         else:
             c = QColor(color)
-            
+
         if width is None:
             w = self._active_width() / self._scale
         else:
             w = float(width)
-            
-        self._cur = {"points": [], "width": w,
-                     "color": c, "origin": origin}
+
+        self._cur = {"points": [], "width": w, "color": c,
+                     "origin": origin, "is_eraser": is_eraser}
         self._ema = None
 
     def _extend_stroke(self, screen_pt):
@@ -423,6 +584,12 @@ class Canvas(QWidget):
             self._strokes.append(self._cur)
             if self.bridge:
                 self.bridge.push_stroke(self._stroke_msg(self._cur))
+        self._cur = None
+        self._ema = None
+        self._touching = False
+        self.update()
+
+    def _cancel_stroke(self):
         self._cur = None
         self._ema = None
         self._touching = False
@@ -462,29 +629,46 @@ class Canvas(QWidget):
             self._clear()
             return
         if data.get("type") == "tool":
-            self._mode = data.get("mode", "draw")
-            w = data.get("width", 3.0)
+            # Phone speaks "pen"/"eraser"; the laptop uses "draw"/"erase".
+            m = data.get("mode", "draw")
+            self._mode = "erase" if m in ("erase", "eraser") else "draw"
+            # Phone sends width in WORLD units; convert back to screen px.
+            w = float(data.get("width", 3.0)) * self._scale
             if self._mode == "erase":
                 self._erase_width = w
             else:
                 self._draw_width = w
+            self.toolbar.sync_ui()
             self.update()
             return
         if data.get("type") == "start":
             self._begin_stroke(
                 origin=data.get("id", "phone"),
                 color=data.get("color"),
-                width=data.get("w")
+                width=data.get("w"),
+                is_eraser=data.get("is_eraser", False),
             )
-
-        if data.get("count", 0) == 0 or not data.get("points"):
+            self._extend_from_points(data)
+            return
+        if data.get("type") == "move":
+            self._extend_from_points(data)
+            return
+        if data.get("type") == "end":
             self._end_stroke()
             return
+        if data.get("type") == "cancel":
+            self._cancel_stroke()
+            return
 
-        p = data["points"][0]
+    def _extend_from_points(self, data):
+        """Pull the first world point out of a phone start/move message."""
+        pts = data.get("points")
+        if not pts:
+            return
+        p = pts[0]
         if "wx" in p:                       # phone sends world coords
             self._extend_stroke_world(QPointF(p["wx"], p["wy"]))
-        else:                               # legacy fallback (normalized coords)
+        elif "nx" in p:                     # legacy fallback (normalized coords)
             self._extend_stroke(QPointF(p["nx"] * self.width(), p["ny"] * self.height()))
 
     # ---- mouse / trackpad input (same pipeline) --------------------------
@@ -516,21 +700,38 @@ class Canvas(QWidget):
         elif event.button() == Qt.MiddleButton:
             self._panning = False
 
-    def resizeEvent(self, event):
-        # The screen center moved, so the shared look-at point changed; re-sync.
-        self._emit_camera()
-
     # ---- rendering -------------------------------------------------------
     def _draw_stroke(self, painter, stroke):
-        pen = QPen(stroke["color"], stroke["width"])
+        # Eraser strokes always paint the CURRENT background, so changing the
+        # background re-colors them too (rather than showing a stale baked color).
+        color = self.bg_color if stroke.get("is_eraser") else stroke["color"]
+        pen = QPen(color, stroke["width"])
         pen.setCapStyle(Qt.RoundCap)
         pen.setJoinStyle(Qt.RoundJoin)
         painter.setPen(pen)
         painter.drawPath(smooth_path(stroke["points"]))
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.toolbar.move((self.width() - self.toolbar.width()) // 2,
+                          self.height() - self.toolbar.height() - 30)
+        # The screen center moved, so the shared look-at point changed; re-sync.
+        self._emit_camera()
+
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), BG_COLOR)
+        painter.fillRect(self.rect(), self.bg_color)
+        
+        if getattr(self, "show_grid", True):
+            grid_size = int(40 * self._scale)
+            if grid_size > 5:
+                painter.setPen(QColor(255, 255, 255, 10))
+                offset_x = int(self._pan.x()) % grid_size
+                offset_y = int(self._pan.y()) % grid_size
+                for x in range(offset_x, self.width(), grid_size):
+                    painter.drawLine(x, 0, x, self.height())
+                for y in range(offset_y, self.height(), grid_size):
+                    painter.drawLine(0, y, self.width(), y)
         painter.setRenderHint(QPainter.Antialiasing)
 
         # Apply the camera, then draw every stroke in world coordinates.

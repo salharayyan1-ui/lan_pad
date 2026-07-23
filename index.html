@@ -85,8 +85,8 @@
     const ctx = pad.getContext("2d");
     const modeEl = document.getElementById("mode-indicator");
 
-    const BG_COLOR = "#1c1c22";
-    const DRAW_COLOR = "#e8e8f0";
+    let BG_COLOR = "#1c1c22";
+    let show_grid = true;
     const SIZE_STEP = 2;             // ±2 per double-press, same as desktop [ ]
     const MIN_WIDTH = 1;
     const MAX_WIDTH = 160;
@@ -111,7 +111,8 @@
         ws.send(JSON.stringify({
           type: "tool",
           id: myId,
-          mode: mode,
+          // Laptop speaks "draw"/"erase"; translate our "pen"/"eraser".
+          mode: mode === "eraser" ? "erase" : "draw",
           width: mode === "eraser" ? localEraseWidth / cam.zoom : localDrawWidth / cam.zoom
         }));
       }
@@ -156,7 +157,7 @@
     }
 
     function activeColor() {
-      return mode === "eraser" ? BG_COLOR : DRAW_COLOR;
+      return mode === "eraser" ? BG_COLOR : tool.color;
     }
     function activeWidth() {
       return mode === "eraser" ? localEraseWidth : localDrawWidth;
@@ -210,7 +211,7 @@
     }
 
     function drawStroke(s) {
-      ctx.strokeStyle = s.color;
+      ctx.strokeStyle = s.is_eraser ? BG_COLOR : s.color;
       ctx.lineWidth = s.w;            // world units; scaled by zoom below
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
@@ -222,6 +223,27 @@
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.fillStyle = BG_COLOR;
       ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+      // Draw grid if active
+      if (show_grid) {
+        ctx.beginPath();
+        const GRID = 40 * cam.zoom;
+        const offsetX = -(cam.lax * cam.zoom) % GRID;
+        const offsetY = -(cam.lay * cam.zoom) % GRID;
+        
+        ctx.strokeStyle = "rgba(255,255,255,0.04)";
+        ctx.lineWidth = 1;
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        
+        for (let x = offsetX; x < w; x += GRID) {
+          ctx.moveTo(x, 0); ctx.lineTo(x, h);
+        }
+        for (let y = offsetY; y < h; y += GRID) {
+          ctx.moveTo(0, y); ctx.lineTo(w, y);
+        }
+        ctx.stroke();
+      }
       // Apply the shared camera, then draw everything in world coords.
       ctx.translate(panX(), panY());
       ctx.scale(cam.zoom, cam.zoom);
@@ -237,16 +259,24 @@
         cam.zoom = msg.zoom; cam.lax = msg.lax; cam.lay = msg.lay; redraw();
       } else if (msg.t === "tool") {
         tool.color = msg.color; tool.w = msg.w;
-        mode = (msg.color === BG_COLOR) ? "eraser" : "pen";
+        if (msg.bg_color) {
+          BG_COLOR = msg.bg_color;
+        }
+        if (msg.show_grid !== undefined) {
+          show_grid = msg.show_grid;
+        }
+        // Laptop sends "draw"/"erase"; translate to our "pen"/"eraser".
+        mode = (msg.mode === "erase" || msg.mode === "eraser") ? "eraser" : "pen";
         if (mode === "eraser") {
           localEraseWidth = msg.w * cam.zoom;
         } else {
           localDrawWidth = msg.w * cam.zoom;
         }
         flashIndicator(true);
+        redraw();
       } else if (msg.t === "stroke") {
         if (msg.origin !== myId) {          // ignore echoes of our own strokes
-          strokes.push({ pts: msg.pts, w: msg.w, color: msg.color });
+          strokes.push({ pts: msg.pts, w: msg.w, color: msg.color, is_eraser: msg.is_eraser });
           redraw();
         }
       } else if (msg.t === "clear") {
@@ -310,6 +340,7 @@
       if (type === "start" && cur) {
         msg.color = cur.color;
         msg.w = cur.w;
+        msg.is_eraser = cur.is_eraser;
       }
       ws.send(JSON.stringify(msg));
     }
@@ -319,7 +350,7 @@
     function beginLocal(cx, cy) {
       ema = [cx, cy];
       const w = activeWidth() / cam.zoom;    // world-space width
-      cur = { pts: [screenToWorld(cx, cy)], w: w, color: activeColor() };
+      cur = { pts: [screenToWorld(cx, cy)], w: w, color: activeColor(), is_eraser: mode === "eraser" };
       redraw();
       const [wx, wy] = cur.pts[0];
       sendPoint("start", wx, wy, 0);
@@ -390,11 +421,10 @@
           beginLocal(t.clientX, t.clientY);
         }
       } else {
-        // Multi-finger: keep any in-progress stroke so we stay in sync with the laptop
+        // Multi-finger: abort any in-progress stroke so we don't leave dots
         if (cur) {
-          if (cur.pts.length) strokes.push(cur);
           cur = null; ema = null;
-          sendPoint("end", null, null, 0);
+          sendPoint("cancel", null, null, 0);
           redraw();
         }
         const gs = {
