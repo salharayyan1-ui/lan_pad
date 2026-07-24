@@ -6,8 +6,7 @@ network — no cloud, no accounts, no native phone app (the phone just opens a w
 page).
 
 > ⚡ **Vibecoded.** This project was built conversationally, milestone by milestone,
-> with an AI pair programmer (Claude Code) — from the first "print the coordinates"
-> proof-of-concept to the shared-camera two-way sync and the packaged executable.
+> with Claude Code with only a few things hardcoded manually.
 
 ## How It Works
 
