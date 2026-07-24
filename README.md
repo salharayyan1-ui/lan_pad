@@ -5,6 +5,10 @@ infinite, pan/zoomable canvas on your desktop. Everything runs on your local
 network — no cloud, no accounts, no native phone app (the phone just opens a web
 page).
 
+> ⚡ **Vibecoded.** This project was built conversationally, milestone by milestone,
+> with an AI pair programmer (Claude Code) — from the first "print the coordinates"
+> proof-of-concept to the shared-camera two-way sync and the packaged executable.
+
 ## How It Works
 
 A Python desktop app (`PySide6`) hosts two servers on your machine:
